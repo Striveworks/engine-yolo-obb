@@ -14,7 +14,6 @@ from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
-from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import ops
 
 JSON: TypeAlias = dict[str, "JSON"] | list["JSON"] | str | int | float | bool | None
@@ -27,16 +26,13 @@ logger = logging.getLogger(__name__)
 
 
 def load_model_mar(model_mar_path: Path):
-    temp_model_pt_file = tempfile.NamedTemporaryFile("wb", suffix=".pt", delete=False)
-    with zipfile.ZipFile(model_mar_path, "r") as zfp:
-        model_config = {}
-        if "model_config.json" in zfp.namelist():
-            model_config = json.loads(zfp.read("model_config.json"))
+    with tempfile.NamedTemporaryFile("wb", suffix=".pt") as temp_model_pt_file:
+        with zipfile.ZipFile(model_mar_path, "r") as zfp:
+            manifest = json.loads(zfp.read("MAR-INF/MANIFEST.json"))
+            with zfp.open(manifest["model"]["serializedFile"]) as zip_model_pt_file:
+                temp_model_pt_file.write(zip_model_pt_file.read())
 
-        manifest = json.loads(zfp.read("MAR-INF/MANIFEST.json"))
-        with zfp.open(manifest["model"]["serializedFile"]) as zip_model_pt_file:
-            temp_model_pt_file.write(zip_model_pt_file.read())
-    return model_config, Path(temp_model_pt_file.name)
+        return YOLO(temp_model_pt_file.name, task="obb")
 
 
 class ModelHandler:
@@ -50,14 +46,27 @@ class ModelHandler:
         logger.info("Done loading model.")
 
     def _load_model(self, model_path: Path):
-        assert model_path.exists(), f"model_path {model_path!r} does not exist"
         if model_path.is_dir():
+            # If the provided path is a directory, look first for `model.pt`,
+            # then for `model-store/model.mar` (legacy format).
+            model_pt_path = model_path / "model.pt"
             model_mar_path = model_path / "model-store" / "model.mar"
-            model_config, model_pt_path = load_model_mar(model_mar_path)
+            if model_pt_path.exists():
+                logger.info(f"Loading model from {str(model_pt_path)!r}...")
+                self.model = YOLO(model_pt_path, task="obb")
+            elif model_mar_path.exists():
+                logger.info(f"Loading model from {str(model_mar_path)!r}...")
+                self.model = load_model_mar(model_mar_path)
+            else:
+                raise ValueError(
+                    f"model_path {str(model_path)!r} is a directory, "
+                    f"but neither {str(model_pt_path)!r} nor {str(model_mar_path)!r} exist."
+                )
         else:
-            # TODO: load `idx_to_class` and `resize_to` from some kind of config file
-            model_config = {}
-            model_pt_path = model_path
+            if not model_path.exists():
+                raise ValueError(f"model_path {str(model_path)!r} does not exist")
+            logger.info(f"Loading model from {str(model_path)!r}...")
+            self.model = YOLO(model_path, task="obb")
 
         if torch.cuda.is_available():
             logger.info(f"CUDA is available. Using device {torch.cuda.current_device()}.")
@@ -66,23 +75,10 @@ class ModelHandler:
         self.device = torch.device(
             "cuda:" + str(torch.cuda.current_device()) if torch.cuda.is_available() else "cpu"
         )
-        self.model = YOLO(model_pt_path, task="obb").to(self.device)
+        self.model = self.model.to(self.device)
 
-        if model_path.is_dir():
-            model_pt_path.unlink()  # cleanup the temporary file
-
+        # TODO(s.maddox): parameterize max_nms?
         self.predictor = self._get_predictor(max_nms=2048)
-
-        idx_to_class = model_config.get("idx_to_class")
-        if idx_to_class:
-            assert isinstance(self.model.model, DetectionModel)
-            self.model.model.names = {int(id): label for id, label in idx_to_class.items()}
-
-        resize_to = model_config.get("resize_to")
-        if resize_to:
-            self.resize_to = resize_to
-        else:
-            self.resize_to = 640
 
     def _get_predictor(self, max_nms: int = 30000):
         predictor_cls = self.model._smart_load("predictor")
@@ -150,7 +146,6 @@ class ModelHandler:
                 *args,
                 **{**kwargs, **{"conf": score_threshold}},
                 predictor=self.predictor,
-                imgsz=self.resize_to,
                 save_conf=True,
                 device=self.device,
             )
